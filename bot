@@ -1,0 +1,372 @@
+import discord
+from discord.ext import commands, tasks
+from discord.ext.commands import has_permissions, MinimalHelpCommand
+from datetime import datetime, timedelta
+import asyncio
+import sqlite3
+from sqlite3 import Error
+import json
+
+intents = discord.Intents.default()
+intents.messages = True
+intents.message_content = True
+intents.guilds = True
+intents.members = True
+
+class CustomHelpCommand(MinimalHelpCommand):
+    async def send_bot_help(self, mapping):
+        ctx = self.context
+        help_embed = discord.Embed(title="Команды бота", description="Вот список доступных команд и их примеры использования:", color=discord.Color.blue())
+
+        for cog, commands in mapping.items():
+            for command in commands:
+                help_embed.add_field(name=f"!{command.name}", value=command.help, inline=False)
+        
+        await ctx.send(embed=help_embed)
+
+    async def send_command_help(self, command):
+        ctx = self.context
+        help_embed = discord.Embed(title=f"Команда !{command.name}", description=command.help, color=discord.Color.blue())
+        await ctx.send(embed=help_embed)
+
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=CustomHelpCommand())
+
+# ID владельца, которому даем бесконечные эликсиры
+OWNER_USER_ID = 1000318947859628083  # Замените на ID владельца
+
+# ID человека, который имеет доступ к !chikibanbony12
+CENWHOCBWIEHC = 902977851228303390  # Замените на свой ID
+
+# ID канала для отправки сообщений о мутах
+MUTE_LOG_CHANNEL_ID = 1253378438853689386  # Замените на ID вашего канала
+
+# Словарь для хранения количества "эликсира" у каждого пользователя
+user_elixir = {}
+
+# Словарь для хранения пользователей, которые купили доступ к команде /nick
+nick_access_users = set()
+
+# Роли и их стоимость в эликсирах для магазина
+roles_prices = {
+    "VIP": 2500,
+    "VIP+": 7500,
+    "MVP": 15000,
+    "MVP+": 30000
+}
+
+rules = {
+    "spam": "Запрещено спамить, флудить, злоупотреблять Caps'ом.",
+    "advertising": "Запрещено пиарить (рекламировать) что-либо (ссылки).",
+    "politics": "Запрещено обсуждать политику, политических деятелей, и все действия связанные с войной.",
+    "false_info": "Запрещено разглашать ложную информацию, представляться командой проекта или использовать схожие ники."
+}
+
+warnings = {}
+
+# Словарь для хранения ролей пользователей
+user_roles = {}
+
+# Подключение к базе данных SQLite
+def create_connection():
+    conn = None
+    try:
+        conn = sqlite3.connect('bot_data.db')
+    except Error as e:
+        print(e)
+    return conn
+
+# Создание таблиц в базе данных
+def create_tables():
+    conn = create_connection()
+    with conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_elixir (
+                user_id INTEGER PRIMARY KEY,
+                elixir_amount INTEGER
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS nick_access_users (
+                user_id INTEGER PRIMARY KEY
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_roles (
+                user_id INTEGER,
+                role_name TEXT,
+                expires_at TEXT,
+                PRIMARY KEY (user_id, role_name)
+            )
+        """)
+
+# Сохранение данных в базу данных
+def save_data():
+    conn = create_connection()
+    with conn:
+        cursor = conn.cursor()
+        # Сохраняем данные об эликсирах
+        cursor.executemany("""
+            INSERT OR REPLACE INTO user_elixir (user_id, elixir_amount) VALUES (?, ?)
+        """, user_elixir.items())
+        # Сохраняем данные о доступе к команде /nick
+        cursor.executemany("""
+            INSERT OR REPLACE INTO nick_access_users (user_id) VALUES (?)
+        """, [(user_id,) for user_id in nick_access_users])
+        # Сохраняем данные о временных ролях
+        cursor.executemany("""
+            INSERT OR REPLACE INTO user_roles (user_id, role_name, expires_at) VALUES (?, ?, ?)
+        """, [(user_id, info["role"], info["expires_at"].isoformat()) for user_id, info in user_roles.items()])
+
+# Загрузка данных из базы данных
+def load_data():
+    global user_elixir, nick_access_users, user_roles
+    conn = create_connection()
+    with conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, elixir_amount FROM user_elixir")
+        user_elixir = dict(cursor.fetchall())
+        cursor.execute("SELECT user_id FROM nick_access_users")
+        nick_access_users = set(user_id for user_id, in cursor.fetchall())
+        cursor.execute("SELECT user_id, role_name, expires_at FROM user_roles")
+        user_roles = {
+            user_id: {"role": role_name, "expires_at": datetime.fromisoformat(expires_at)}
+            for user_id, role_name, expires_at in cursor.fetchall()
+        }
+
+# Задача для периодической проверки ролей
+@tasks.loop(minutes=60)  # Проверяем каждые 60 минут
+async def check_roles():
+    current_time = datetime.now()
+    to_remove = []
+
+    for user_id, info in user_roles.items():
+        if info["expires_at"] <= current_time:
+            guild = bot.get_guild(1254828776404160514)  # Замените на ID вашего сервера
+            member = guild.get_member(user_id)
+            if member:
+                role = discord.utils.get(guild.roles, name=info["role"])
+                if role in member.roles:
+                    await member.remove_roles(role)
+                    to_remove.append(user_id)
+
+    # Удаляем записи о пользователях, у которых роль уже снята
+    for user_id in to_remove:
+        del user_roles[user_id]
+    save_data()  # Сохраняем изменения в базе данных
+
+# Функция для начисления "эликсира" за сообщения
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+
+    if len(message.content) > 0:
+        elixir_earned = len(message.content) // 50  # За каждые 50 символов
+        if elixir_earned > 0:
+            if message.author.id in user_elixir:
+                user_elixir[message.author.id] += elixir_earned
+            else:
+                user_elixir[message.author.id] = elixir_earned
+            save_data()  # Сохраняем изменения в базе данных
+
+    # Проверка на спам
+    if is_spam(message):
+        await handle_warning(message, "spam")
+        await message.delete()
+    # Проверка на ссылки
+    elif "http://" in message.content.lower() or "https://" in message.content.lower():
+        await handle_warning(message, "advertising")
+        await message.delete()
+    # Проверка на политические высказывания
+    elif is_political(message):
+        await handle_warning(message, "politics")
+        await message.delete()
+
+    await bot.process_commands(message)
+
+# Функция для проверки спама
+def is_spam(message):
+    recent_messages = list(filter(lambda m: m.author == message.author, bot.cached_messages))[-3:]
+    if len(recent_messages) >= 3:
+        if all(m.content == recent_messages[0].content for m in recent_messages):
+            return True
+    if any(len(set(m.content)) == 1 and len(m.content) >= 5 for m in recent_messages):
+        return True
+    return False
+
+# Функция для проверки политических высказываний
+def is_political(message):
+    political_phrases = [
+        "выйграет эту войну", "СТРАНА а СТРАНА проиграет", "в стране все очень плохо", "экономика",
+        "страна плохая", "политика", "политических деятелей", "действия связанные с войной"
+    ]
+    return any(phrase in message.content.lower() for phrase in political_phrases)
+
+# Функция для обработки предупреждений и наказаний
+async def handle_warning(message, rule):
+    author_id = message.author.id
+    if author_id in warnings:
+        warnings[author_id][rule] += 1
+    else:
+        warnings[author_id] = {r: 0 for r in rules.keys()}
+        warnings[author_id][rule] = 1
+
+    if warnings[author_id][rule] == 1:
+        await message.author.send(f"Вы получили предупреждение за нарушение правила: {rules[rule]}")
+    elif warnings[author_id][rule] == 2:
+        await message.author.send(f"Вы получили мут на 30 минут за повторное нарушение правила: {rules[rule]}")
+        await mute_user(message.author, timedelta(minutes=30))
+    elif warnings[author_id][rule] == 3:
+        await message.author.send(f"Вы получили мут на 3 часа за третье нарушение правила: {rules[rule]}")
+        await mute_user(message.author, timedelta(hours=3))
+    elif warnings[author_id][rule] == 4:
+        await message.author.send(f"Вы получили мут на 1 день за четвертое нарушение правила: {rules[rule]}")
+        await mute_user(message.author, timedelta(days=1))
+    elif warnings[author_id][rule] >= 5:
+        await message.author.send(f"Вы получили мут на 7 дней за пятое и последующие нарушения правила: {rules[rule]}")
+        await mute_user(message.author, timedelta(days=7))
+
+# Функция для выдачи мута пользователю
+async def mute_user(member, duration):
+    guild = member.guild
+    muted_role = discord.utils.get(guild.roles, name="Muted")  # Замените на имя роли для мута
+
+    if not muted_role:
+        muted_role = await guild.create_role(name="Muted")
+        for channel in guild.channels:
+            await channel.set_permissions(muted_role, send_messages=False)
+
+    await member.add_roles(muted_role)
+    await asyncio.sleep(duration.total_seconds())
+    await member.remove_roles(muted_role)
+
+    # Логгирование мута
+    mute_log_channel = guild.get_channel(MUTE_LOG_CHANNEL_ID)
+    if mute_log_channel:
+        embed = discord.Embed(title="Лог мута", color=discord.Color.red())
+        embed.add_field(name="Пользователь", value=member.mention)
+        embed.add_field(name="Модератор", value="Автомодерация")
+        embed.add_field(name="Время", value=f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC", inline=False)
+        embed.add_field(name="Продолжительность", value=f"{duration}", inline=False)
+        await mute_log_channel.send(embed=embed)
+
+@bot.event
+async def on_ready():
+    print(f'Logged in as {bot.user.name}')
+
+@bot.command(name='balance', help='Показывает текущий баланс эликсиров пользователя.')
+async def balance(ctx):
+    user_id = ctx.author.id
+    if user_id in user_elixir:
+        if user_elixir[user_id] == float('inf'):
+            await ctx.send(f"Ваш текущий баланс эликсиров: ∞")
+        else:
+            await ctx.send(f"Ваш текущий баланс эликсиров: {user_elixir[user_id]}")
+    else:
+        await ctx.send("У вас пока нет эликсиров.")
+
+@bot.command(name='buyrole', help='Покупает роль за указанное количество эликсиров.')
+async def buy_role(ctx, role_name: str):
+    user_id = ctx.author.id
+    if role_name.upper() in roles_prices:
+        role_price = roles_prices[role_name.upper()]
+        if user_id in user_elixir and user_elixir[user_id] >= role_price:
+            guild = ctx.guild
+            role = discord.utils.get(guild.roles, name=role_name.upper())
+            if role:
+                await ctx.author.add_roles(role)
+                user_elixir[user_id] -= role_price
+                save_data()
+                await ctx.send(f"Вы успешно купили роль {role_name} за {role_price} эликсиров.")
+            else:
+                await ctx.send(f"Роль {role_name} не найдена на сервере.")
+        else:
+            await ctx.send(f"Недостаточно эликсиров для покупки роли {role_name}.")
+    else:
+        await ctx.send(f"Роль {role_name} не существует или не доступна для покупки.")
+
+@bot.command(name='nick', help='Изменяет ник пользователя.')
+async def change_nick(ctx, *, new_nick):
+    user_id = ctx.author.id
+    if user_id in nick_access_users:
+        try:
+            await ctx.author.edit(nick=new_nick)
+            await ctx.send(f"Ник успешно изменён на {new_nick}.")
+        except discord.Forbidden:
+            await ctx.send("У меня нет прав на изменение вашего ника.")
+    else:
+        await ctx.send("У вас нет доступа к этой команде. Купите доступ в магазине.")
+
+@bot.command(name='rules', help='Отправляет список правил сервера в личные сообщения.')
+async def send_rules(ctx):
+    for rule, description in rules.items():
+        await ctx.author.send(f"Правило: {description}")
+
+@bot.command(name='buyaccess', help='Покупает доступ к команде /nick за 10000 эликсиров.')
+async def buy_access(ctx):
+    user_id = ctx.author.id
+    if user_id in user_elixir and user_elixir[user_id] >= 10000:
+        user_elixir[user_id] -= 10000
+        nick_access_users.add(user_id)
+        save_data()
+        await ctx.send("Вы успешно купили доступ к команде /nick.")
+    else:
+        await ctx.send("Недостаточно эликсиров для покупки доступа к команде /nick.")
+
+@bot.command(name='chikibanbony12', help='Команда для CENWHOCBWIEHC.')
+async def chikibanbony12(ctx):
+    if ctx.author.id == CENWHOCBWIEHC:
+        await ctx.send("Привет, CENWHOCBWIEHC! Эта команда только для тебя.")
+    else:
+        await ctx.send("Извините, у вас нет доступа к этой команде.")
+
+@bot.command(name='pay', help='Переводит указанное количество эликсиров другому пользователю.')
+async def pay(ctx, member: discord.Member, amount: int):
+    if ctx.author.id != member.id:
+        if ctx.author.id in user_elixir and user_elixir[ctx.author.id] >= amount > 0:
+            if member.id in user_elixir:
+                user_elixir[ctx.author.id] -= amount
+                user_elixir[member.id] += amount
+                save_data()
+                await ctx.send(f"Вы успешно перевели {amount} эликсиров {member.mention}.")
+            else:
+                await ctx.send("Указанный пользователь не зарегистрирован в системе эликсиров.")
+        else:
+            await ctx.send("У вас недостаточно эликсиров для выполнения этой операции.")
+    else:
+        await ctx.send("Вы не можете переводить эликсиры самому себе.")
+
+@bot.command(name='grant', help='Даёт временную роль пользователю.')
+@commands.has_permissions(administrator=True)
+async def grant_role(ctx, member: discord.Member, role_name: str, duration: int):
+    role = discord.utils.get(ctx.guild.roles, name=role_name.upper())
+    if role:
+        await member.add_roles(role)
+        expires_at = datetime.now() + timedelta(hours=duration)
+        user_roles[member.id] = {"role": role_name.upper(), "expires_at": expires_at}
+        save_data()
+        await ctx.send(f"Роль {role_name} успешно выдана пользователю {member.display_name} на {duration} часов.")
+    else:
+        await ctx.send(f"Роль {role_name} не найдена на сервере.")
+
+@bot.command(name='revoke', help='Отзывает временную роль у пользователя.')
+@commands.has_permissions(administrator=True)
+async def revoke_role(ctx, member: discord.Member, role_name: str):
+    role = discord.utils.get(ctx.guild.roles, name=role_name.upper())
+    if role:
+        await member.remove_roles(role)
+        if member.id in user_roles and user_roles[member.id]["role"] == role_name.upper():
+            del user_roles[member.id]
+            save_data()
+        await ctx.send(f"Роль {role_name} успешно отозвана у пользователя {member.display_name}.")
+    else:
+        await ctx.send(f"Роль {role_name} не найдена на сервере.")
+
+
+# Загрузка данных при старте бота
+create_tables()
+load_data()
+
+# Запуск бота
+bot.run('Бот токен')
